@@ -194,6 +194,109 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+-- 跨村安置资源替代编排 -----------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS relocation_sites (
+    site_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    township TEXT NOT NULL,
+    capacity_units INTEGER NOT NULL,
+    occupied_units INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    CHECK(occupied_units >= 0 AND occupied_units <= capacity_units)
+);
+
+CREATE TABLE IF NOT EXISTS relocation_resources (
+    resource_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('turnover-home','resettlement-home','homestead-quota')),
+    site_id TEXT REFERENCES relocation_sites(site_id),
+    township TEXT NOT NULL,
+    village TEXT NOT NULL,
+    area_sqm TEXT NOT NULL,
+    beds INTEGER NOT NULL,
+    accessible INTEGER NOT NULL CHECK(accessible IN (0,1)),
+    school_km TEXT NOT NULL,
+    medical_km TEXT NOT NULL,
+    commute_km TEXT NOT NULL,
+    quality_tier INTEGER NOT NULL,
+    restrictions_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'available'
+        CHECK(state IN ('available','reserved','occupied','retired')),
+    household_id TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_relocation_resources_pool
+ON relocation_resources(kind, state, township, village);
+
+CREATE TABLE IF NOT EXISTS relocation_applications (
+    household_id TEXT PRIMARY KEY,
+    head_name TEXT NOT NULL,
+    origin_village TEXT NOT NULL,
+    member_count INTEGER NOT NULL,
+    definition_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'registered'
+        CHECK(state IN ('registered','confirmed','occupied','cancelled')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    registered_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    registered_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relocation_plans (
+    plan_id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL REFERENCES relocation_applications(household_id),
+    snapshot_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    chosen_candidate_id TEXT,
+    state TEXT NOT NULL DEFAULT 'proposed'
+        CHECK(state IN ('proposed','confirmed','occupied','cancelled')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    cancelled_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relocation_active_plan
+ON relocation_plans(household_id) WHERE state IN ('proposed','confirmed');
+
+CREATE TABLE IF NOT EXISTS relocation_plan_resources (
+    plan_id TEXT NOT NULL REFERENCES relocation_plans(plan_id),
+    candidate_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL REFERENCES relocation_resources(resource_id),
+    expected_resource_revision INTEGER NOT NULL,
+    expected_site_revision INTEGER,
+    PRIMARY KEY(plan_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS relocation_occupancies (
+    occupancy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES relocation_plans(plan_id),
+    household_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL REFERENCES relocation_resources(resource_id),
+    site_id TEXT REFERENCES relocation_sites(site_id),
+    state TEXT NOT NULL DEFAULT 'reserved' CHECK(state IN ('reserved','occupied','released')),
+    parent_occupancy_id INTEGER REFERENCES relocation_occupancies(occupancy_id),
+    resource_revision INTEGER NOT NULL,
+    site_revision INTEGER,
+    reserved_at TEXT NOT NULL,
+    occupied_at TEXT,
+    released_at TEXT,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_relocation_occupancy_resource
+ON relocation_occupancies(resource_id, occupancy_id);
+
+CREATE INDEX IF NOT EXISTS idx_relocation_occupancy_household
+ON relocation_occupancies(household_id, occupancy_id);
 """
 
 

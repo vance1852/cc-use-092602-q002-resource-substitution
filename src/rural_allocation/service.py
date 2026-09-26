@@ -39,10 +39,11 @@ ROLE_PERMISSIONS = {
 
 
 class SupplyService:
-    def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+    def __init__(self, connection: sqlite3.Connection, clock=None, *, initialize_schema: bool = True) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
-        initialize(connection)
+        if initialize_schema:
+            initialize(connection)
 
     def _now(self) -> str:
         return utc_text(self.clock.now())

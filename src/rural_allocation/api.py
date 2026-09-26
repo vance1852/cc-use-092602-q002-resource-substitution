@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .errors import SupplyError, ValidationFailed
+from .relocation_service import RelocationService
 from .service import SupplyService
 from .storage import connect
 
@@ -22,8 +23,9 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: SupplyService, relocation: RelocationService | None = None) -> None:
         self.service = service
+        self.relocation = relocation
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -85,6 +87,27 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            # 跨村安置资源替代编排
+            relocation = self.relocation
+            if relocation is not None:
+                if method == "POST" and path == "/relocation/sites":
+                    return Response(201, relocation.create_site(actor, payload))
+                if method == "POST" and path == "/relocation/resources":
+                    return Response(201, relocation.register_resource(actor, payload))
+                if method == "POST" and path == "/relocation/applications":
+                    return Response(201, relocation.register_application(actor, payload))
+                if method == "POST" and path == "/relocation/plans":
+                    return Response(201, relocation.generate_plan(actor, payload))
+                if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "plans"] and parts[3] == "confirm":
+                    return Response(200, relocation.confirm_plan(actor, parts[2], payload))
+                if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "plans"] and parts[3] == "deliver":
+                    return Response(200, relocation.deliver_plan(actor, parts[2]))
+                if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "applications"] and parts[3] == "cancel":
+                    return Response(200, relocation.cancel_application(actor, parts[2], payload))
+                if method == "GET" and len(parts) == 3 and parts[:2] == ["relocation", "plans"]:
+                    return Response(200, relocation.plan_detail(actor, parts[2]))
+                if method == "GET" and len(parts) == 4 and parts[:2] == ["relocation", "households"] and parts[3] == "genealogy":
+                    return Response(200, relocation.household_genealogy(actor, parts[2]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
@@ -126,7 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    service = SupplyService(connection)
+    relocation = RelocationService(connection)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(service, relocation)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
