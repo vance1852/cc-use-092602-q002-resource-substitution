@@ -1,4 +1,4 @@
-"""补偿单价、土地库存、地块资源池和提名的事务用例。"""
+"""补偿单价、土地库存、地块资源池、提名和跨村安置替代编排的事务用例。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,19 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    RelocationApplicationInput,
+    RelocationNeeds,
+    ResettlementResourceInput,
+    ResettlementSiteInput,
+    Route,
+    SupplyScenario,
+    identifier,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -27,14 +39,15 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .relocation import build_candidates, infra_remaining_households, remaining_households
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "resettlement.catalog"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write", "relocation.write", "relocation.read"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "relocation.read"},
 }
 
 
@@ -569,3 +582,632 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    def _idempotency_lookup(self, scope: str, key: str, request_digest: str) -> dict[str, Any] | None:
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM supply_idempotency WHERE scope=? AND idempotency_key=?",
+            (scope, key),
+        ).fetchone()
+        if stored is None:
+            return None
+        if stored["request_sha256"] != request_digest:
+            raise Conflict("幂等键对应不同请求内容")
+        return json.loads(stored["response_json"])
+
+    def _idempotency_store(self, scope: str, key: str, request_digest: str, response: Mapping[str, Any]) -> None:
+        self.connection.execute(
+            "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (scope, key, request_digest, canonical_json(response), self._now()),
+        )
+
+    @staticmethod
+    def _expected_revision(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValidationFailed("expected_revision 必须是正整数")
+        return value
+
+    def create_resettlement_site(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "resettlement.catalog")
+        site = ResettlementSiteInput.from_dict(raw)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO resettlement_sites(site_id,name,township,village,infra_capacity_households,"
+                    "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        site.site_id,
+                        site.name,
+                        site.township,
+                        site.village,
+                        site.infra_capacity_households,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("resettlement_site", site.site_id, "resettlement_site.created", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("安置点编号已经存在") from exc
+        return self.resettlement_site(site.site_id)
+
+    def resettlement_site(self, site_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM resettlement_sites WHERE site_id=?", (site_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("安置点不存在")
+        return dict(row)
+
+    def set_resettlement_site_state(self, actor_id: str, site_id: str, state: object, expected_revision: object) -> dict[str, Any]:
+        self._require(actor_id, "resettlement.catalog")
+        if state not in ("active", "suspended"):
+            raise ValidationFailed("安置点状态必须是 active 或 suspended")
+        revision = self._expected_revision(expected_revision)
+        self.resettlement_site(site_id)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE resettlement_sites SET state=?,revision=revision+1 WHERE site_id=? AND revision=? AND state<>?",
+                (state, site_id, revision, state),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("安置点不是指定版本或已处于目标状态")
+            self._audit("resettlement_site", site_id, "resettlement_site.state_changed", actor_id, {"state": state})
+        return self.resettlement_site(site_id)
+
+    def create_resettlement_resource(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "resettlement.catalog")
+        resource = ResettlementResourceInput.from_dict(raw)
+        self.resettlement_site(resource.site_id)
+        eligible = "*" if resource.eligible_townships == ("*",) else ",".join(resource.eligible_townships)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO resettlement_resources(resource_id,site_id,kind,area_sqm,max_household_size,"
+                    "accessible,commute_minutes,school_km,clinic_km,eligible_townships,capacity_households,"
+                    "created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        resource.resource_id,
+                        resource.site_id,
+                        resource.kind,
+                        decimal_text(resource.area_sqm),
+                        resource.max_household_size,
+                        1 if resource.accessible else 0,
+                        resource.commute_minutes,
+                        decimal_text(resource.school_km),
+                        decimal_text(resource.clinic_km),
+                        eligible,
+                        resource.capacity_households,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("resettlement_resource", resource.resource_id, "resettlement_resource.created", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("安置资源编号冲突或安置点不存在") from exc
+        return self.resettlement_resource(resource.resource_id)
+
+    def resettlement_resource(self, resource_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM resettlement_resources WHERE resource_id=?", (resource_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("安置资源不存在")
+        result = dict(row)
+        result["accessible"] = bool(result["accessible"])
+        result["eligible_townships"] = str(result["eligible_townships"]).split(",")
+        return result
+
+    def set_resettlement_resource_state(self, actor_id: str, resource_id: str, state: object, expected_revision: object) -> dict[str, Any]:
+        self._require(actor_id, "resettlement.catalog")
+        if state not in ("active", "suspended", "retired"):
+            raise ValidationFailed("安置资源状态必须是 active、suspended 或 retired")
+        revision = self._expected_revision(expected_revision)
+        self.resettlement_resource(resource_id)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE resettlement_resources SET state=?,revision=revision+1 WHERE resource_id=? AND revision=? AND state<>?",
+                (state, resource_id, revision, state),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("安置资源不是指定版本或已处于目标状态")
+            self._audit("resettlement_resource", resource_id, "resettlement_resource.state_changed", actor_id, {"state": state})
+        return self.resettlement_resource(resource_id)
+
+    def register_relocation_application(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "relocation.write")
+        application = RelocationApplicationInput.from_dict(raw)
+        request_digest = digest(raw)
+        stored = self._idempotency_lookup("relocation-application", application.idempotency_key, request_digest)
+        if stored is not None:
+            return stored
+        response = {
+            "application_id": application.application_id,
+            "household_id": application.household_id,
+            "state": "submitted",
+            "revision": 1,
+        }
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO relocation_applications(application_id,household_id,origin_township,origin_village,"
+                    "household_size,needs_json,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        application.application_id,
+                        application.household_id,
+                        application.needs.origin_township,
+                        application.origin_village,
+                        application.needs.household_size,
+                        canonical_json(application.needs.as_dict()),
+                        application.idempotency_key,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._idempotency_store("relocation-application", application.idempotency_key, request_digest, response)
+                self._audit("relocation_application", application.application_id, "relocation.application_submitted", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("申请编号或幂等键冲突") from exc
+        return response
+
+    def _relocation_application_row(self, application_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM relocation_applications WHERE application_id=?", (application_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("安置申请不存在")
+        return row
+
+    @staticmethod
+    def _plan_payload(plan_id: str, rank: int, state: str, revision: int, assignments: list, tradeoffs: list) -> dict[str, Any]:
+        relaxed: list[str] = []
+        for tradeoff in tradeoffs:
+            condition = tradeoff["condition"]
+            if condition not in relaxed:
+                relaxed.append(condition)
+        return {
+            "plan_id": plan_id,
+            "rank": rank,
+            "state": state,
+            "revision": revision,
+            "assignments": assignments,
+            "tradeoffs": tradeoffs,
+            "relaxed_constraints": relaxed,
+        }
+
+    def generate_relocation_candidates(self, actor_id: str, application_id: str) -> dict[str, Any]:
+        self._require(actor_id, "relocation.write")
+        application = self._relocation_application_row(application_id)
+        state = application["state"]
+        if state == "moved_in":
+            raise InvalidState("已经入住的家庭不能自动换房")
+        if state == "confirmed":
+            raise InvalidState("申请已确认安置方案，如需调整请先取消申请")
+        if state == "cancelled":
+            raise InvalidState("申请已取消，不能重新编排")
+        needs_dict = json.loads(application["needs_json"])
+        needs = RelocationNeeds.from_dict(needs_dict)
+        resource_rows = self.connection.execute(
+            "SELECT * FROM resettlement_resources ORDER BY resource_id"
+        ).fetchall()
+        site_rows = self.connection.execute("SELECT * FROM resettlement_sites ORDER BY site_id").fetchall()
+        resources = [dict(row) for row in resource_rows]
+        sites = {row["site_id"]: dict(row) for row in site_rows}
+        input_sha256 = digest({
+            "application_id": application_id,
+            "needs": needs_dict,
+            "resources": resources,
+            "sites": [dict(row) for row in site_rows],
+        })
+        existing = self.connection.execute(
+            "SELECT * FROM relocation_plans WHERE application_id=? AND input_sha256=? AND state='offered' "
+            "ORDER BY candidate_rank",
+            (application_id, input_sha256),
+        ).fetchall()
+        if existing:
+            return {
+                "application_id": application_id,
+                "input_sha256": input_sha256,
+                "replayed": True,
+                "candidates": [
+                    self._plan_payload(
+                        row["plan_id"], row["candidate_rank"], row["state"], row["revision"],
+                        json.loads(row["assignments_json"]), json.loads(row["tradeoffs_json"]),
+                    )
+                    for row in existing
+                ],
+                "unmet_conditions": json.loads(existing[0]["unmet_json"]),
+            }
+        result = build_candidates(needs, resources, sites)
+        now = self._now()
+        candidates: list[dict[str, Any]] = []
+        with transaction(self.connection, immediate=True):
+            old_plans = self.connection.execute(
+                "SELECT plan_id FROM relocation_plans WHERE application_id=? AND state='offered'",
+                (application_id,),
+            ).fetchall()
+            for old in old_plans:
+                self.connection.execute(
+                    "UPDATE relocation_plans SET state='superseded',revision=revision+1 WHERE plan_id=?",
+                    (old["plan_id"],),
+                )
+                self.connection.execute(
+                    "UPDATE relocation_reservations SET state='released',released_at=?,revision=revision+1 "
+                    "WHERE plan_id=? AND state='offered'",
+                    (now, old["plan_id"]),
+                )
+            for candidate in result["candidates"]:
+                plan_id = f"{application_id}-{input_sha256[:12]}-{candidate['rank']}"
+                self.connection.execute(
+                    "INSERT INTO relocation_plans(plan_id,application_id,candidate_rank,input_sha256,"
+                    "assignments_json,tradeoffs_json,unmet_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        plan_id,
+                        application_id,
+                        candidate["rank"],
+                        input_sha256,
+                        canonical_json(candidate["assignments"]),
+                        canonical_json(candidate["tradeoffs"]),
+                        canonical_json(result["unmet_conditions"]),
+                        actor_id,
+                        now,
+                    ),
+                )
+                for assignment in candidate["assignments"]:
+                    self.connection.execute(
+                        "INSERT INTO relocation_reservations(reservation_id,plan_id,application_id,resource_id,"
+                        "site_id,resource_revision,site_revision,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            f"{plan_id}-{assignment['resource_id']}",
+                            plan_id,
+                            application_id,
+                            assignment["resource_id"],
+                            assignment["site_id"],
+                            assignment["resource_revision"],
+                            assignment["site_revision"],
+                            now,
+                        ),
+                    )
+                candidates.append(
+                    self._plan_payload(
+                        plan_id, candidate["rank"], "offered", 1,
+                        candidate["assignments"], candidate["tradeoffs"],
+                    )
+                )
+            self.connection.execute(
+                "UPDATE relocation_applications SET state='planned',revision=revision+1 "
+                "WHERE application_id=? AND state IN ('submitted','planned')",
+                (application_id,),
+            )
+            self._audit(
+                "relocation_application",
+                application_id,
+                "relocation.candidates_generated",
+                actor_id,
+                {"input_sha256": input_sha256, "candidates": len(candidates)},
+            )
+        return {
+            "application_id": application_id,
+            "input_sha256": input_sha256,
+            "replayed": False,
+            "candidates": candidates,
+            "unmet_conditions": result["unmet_conditions"],
+        }
+
+    def confirm_relocation_plan(
+        self,
+        actor_id: str,
+        plan_id: str,
+        expected_revision: object,
+        idempotency_key: object,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "relocation.write")
+        revision = self._expected_revision(expected_revision)
+        key = identifier(idempotency_key, "idempotency_key")
+        request_digest = digest({"action": "confirm", "plan_id": plan_id, "expected_revision": revision})
+        stored = self._idempotency_lookup("relocation-confirm", key, request_digest)
+        if stored is not None:
+            return stored
+        plan = self.connection.execute(
+            "SELECT * FROM relocation_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if plan is None:
+            raise NotFound("安置方案不存在")
+        if plan["state"] != "offered" or plan["revision"] != revision:
+            raise InvalidState("安置方案不是当前可确认版本")
+        application = self._relocation_application_row(plan["application_id"])
+        if application["state"] == "moved_in":
+            raise InvalidState("已经入住的家庭不能自动换房")
+        if application["state"] != "planned":
+            raise InvalidState("申请当前状态不能确认方案")
+        reservations = self.connection.execute(
+            "SELECT * FROM relocation_reservations WHERE plan_id=? AND state='offered' ORDER BY reservation_id",
+            (plan_id,),
+        ).fetchall()
+        if not reservations:
+            raise InvalidState("安置方案没有可确认的预留")
+        with transaction(self.connection, immediate=True):
+            resource_revisions: dict[str, int] = {}
+            site_revisions: dict[str, int] = {}
+            for reservation in reservations:
+                resource_id = reservation["resource_id"]
+                resource = self.connection.execute(
+                    "SELECT * FROM resettlement_resources WHERE resource_id=?", (resource_id,)
+                ).fetchone()
+                expected_resource = resource_revisions.get(resource_id, reservation["resource_revision"])
+                if resource["revision"] != expected_resource or resource["state"] != "active":
+                    raise Conflict(f"房源 {resource_id} 版本已变化，整单确认失败")
+                if remaining_households(resource) < 1:
+                    raise Conflict(f"房源 {resource_id} 容量不足，整单确认失败")
+                site_id = reservation["site_id"]
+                site = self.connection.execute(
+                    "SELECT * FROM resettlement_sites WHERE site_id=?", (site_id,)
+                ).fetchone()
+                expected_site = site_revisions.get(site_id, reservation["site_revision"])
+                if site["revision"] != expected_site or site["state"] != "active":
+                    raise Conflict(f"安置点 {site_id} 版本已变化，整单确认失败")
+                if infra_remaining_households(site) < 1:
+                    raise Conflict(f"安置点 {site_id} 基础设施容量不足，整单确认失败")
+                cursor = self.connection.execute(
+                    "UPDATE resettlement_resources SET reserved_households=reserved_households+1,"
+                    "revision=revision+1 WHERE resource_id=? AND revision=?",
+                    (resource_id, expected_resource),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict(f"房源 {resource_id} 版本已变化，整单确认失败")
+                resource_revisions[resource_id] = expected_resource + 1
+                cursor = self.connection.execute(
+                    "UPDATE resettlement_sites SET reserved_households=reserved_households+1,"
+                    "revision=revision+1 WHERE site_id=? AND revision=?",
+                    (site_id, expected_site),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict(f"安置点 {site_id} 版本已变化，整单确认失败")
+                site_revisions[site_id] = expected_site + 1
+                self.connection.execute(
+                    "UPDATE relocation_reservations SET state='reserved',revision=revision+1 WHERE reservation_id=?",
+                    (reservation["reservation_id"],),
+                )
+            cursor = self.connection.execute(
+                "UPDATE relocation_plans SET state='confirmed',revision=revision+1 WHERE plan_id=? AND revision=?",
+                (plan_id, revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("安置方案不是当前可确认版本")
+            siblings = self.connection.execute(
+                "SELECT plan_id FROM relocation_plans WHERE application_id=? AND state='offered'",
+                (application["application_id"],),
+            ).fetchall()
+            for sibling in siblings:
+                self.connection.execute(
+                    "UPDATE relocation_plans SET state='superseded',revision=revision+1 WHERE plan_id=?",
+                    (sibling["plan_id"],),
+                )
+                self.connection.execute(
+                    "UPDATE relocation_reservations SET state='released',released_at=?,revision=revision+1 "
+                    "WHERE plan_id=? AND state='offered'",
+                    (self._now(), sibling["plan_id"]),
+                )
+            self.connection.execute(
+                "UPDATE relocation_applications SET state='confirmed',revision=revision+1 WHERE application_id=?",
+                (application["application_id"],),
+            )
+            response = {
+                "plan_id": plan_id,
+                "application_id": application["application_id"],
+                "state": "confirmed",
+                "revision": revision + 1,
+                "reservations": [
+                    {
+                        "reservation_id": reservation["reservation_id"],
+                        "resource_id": reservation["resource_id"],
+                        "site_id": reservation["site_id"],
+                        "state": "reserved",
+                    }
+                    for reservation in reservations
+                ],
+            }
+            self._idempotency_store("relocation-confirm", key, request_digest, response)
+            self._audit(
+                "relocation_plan",
+                plan_id,
+                "relocation.plan_confirmed",
+                actor_id,
+                {
+                    "application_id": application["application_id"],
+                    "reservations": [reservation["reservation_id"] for reservation in reservations],
+                },
+            )
+        return response
+
+    def move_in_application(self, actor_id: str, application_id: str, expected_revision: object) -> dict[str, Any]:
+        self._require(actor_id, "relocation.write")
+        revision = self._expected_revision(expected_revision)
+        application = self._relocation_application_row(application_id)
+        if application["state"] != "confirmed" or application["revision"] != revision:
+            raise InvalidState("申请不是当前可入住版本")
+        plan = self.connection.execute(
+            "SELECT * FROM relocation_plans WHERE application_id=? AND state='confirmed'",
+            (application_id,),
+        ).fetchone()
+        if plan is None:
+            raise InvalidState("没有已确认的安置方案")
+        reservations = self.connection.execute(
+            "SELECT * FROM relocation_reservations WHERE plan_id=? AND state='reserved' ORDER BY reservation_id",
+            (plan["plan_id"],),
+        ).fetchall()
+        if not reservations:
+            raise InvalidState("没有待入住的预留")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            for reservation in reservations:
+                self.connection.execute(
+                    "UPDATE relocation_reservations SET state='delivered',delivered_at=?,revision=revision+1 "
+                    "WHERE reservation_id=? AND state='reserved'",
+                    (now, reservation["reservation_id"]),
+                )
+                self.connection.execute(
+                    "UPDATE resettlement_resources SET reserved_households=reserved_households-1,"
+                    "occupied_households=occupied_households+1,revision=revision+1 WHERE resource_id=?",
+                    (reservation["resource_id"],),
+                )
+                self.connection.execute(
+                    "UPDATE resettlement_sites SET reserved_households=reserved_households-1,"
+                    "occupied_households=occupied_households+1,revision=revision+1 WHERE site_id=?",
+                    (reservation["site_id"],),
+                )
+            self.connection.execute(
+                "UPDATE relocation_applications SET state='moved_in',revision=revision+1 "
+                "WHERE application_id=? AND revision=?",
+                (application_id, revision),
+            )
+            self._audit(
+                "relocation_application",
+                application_id,
+                "relocation.household_moved_in",
+                actor_id,
+                {"reservations": [reservation["reservation_id"] for reservation in reservations]},
+            )
+        return {
+            "application_id": application_id,
+            "state": "moved_in",
+            "revision": revision + 1,
+            "delivered": [reservation["reservation_id"] for reservation in reservations],
+        }
+
+    def cancel_relocation_application(self, actor_id: str, application_id: str, idempotency_key: object) -> dict[str, Any]:
+        self._require(actor_id, "relocation.write")
+        key = identifier(idempotency_key, "idempotency_key")
+        request_digest = digest({"action": "cancel", "application_id": application_id})
+        stored = self._idempotency_lookup("relocation-cancel", key, request_digest)
+        if stored is not None:
+            return stored
+        application = self._relocation_application_row(application_id)
+        if application["state"] == "cancelled":
+            raise InvalidState("申请已取消")
+        now = self._now()
+        released: list[str] = []
+        discarded: list[str] = []
+        retained: list[str] = []
+        with transaction(self.connection, immediate=True):
+            reservations = self.connection.execute(
+                "SELECT * FROM relocation_reservations WHERE application_id=? AND state IN ('offered','reserved','delivered') "
+                "ORDER BY reservation_id",
+                (application_id,),
+            ).fetchall()
+            for reservation in reservations:
+                if reservation["state"] == "reserved":
+                    self.connection.execute(
+                        "UPDATE relocation_reservations SET state='released',released_at=?,revision=revision+1 "
+                        "WHERE reservation_id=?",
+                        (now, reservation["reservation_id"]),
+                    )
+                    self.connection.execute(
+                        "UPDATE resettlement_resources SET reserved_households=reserved_households-1,"
+                        "revision=revision+1 WHERE resource_id=?",
+                        (reservation["resource_id"],),
+                    )
+                    self.connection.execute(
+                        "UPDATE resettlement_sites SET reserved_households=reserved_households-1,"
+                        "revision=revision+1 WHERE site_id=?",
+                        (reservation["site_id"],),
+                    )
+                    released.append(reservation["reservation_id"])
+                elif reservation["state"] == "offered":
+                    self.connection.execute(
+                        "UPDATE relocation_reservations SET state='released',released_at=?,revision=revision+1 "
+                        "WHERE reservation_id=?",
+                        (now, reservation["reservation_id"]),
+                    )
+                    discarded.append(reservation["reservation_id"])
+                else:
+                    retained.append(reservation["reservation_id"])
+            self.connection.execute(
+                "UPDATE relocation_plans SET state='superseded',revision=revision+1 "
+                "WHERE application_id=? AND state='offered'",
+                (application_id,),
+            )
+            self.connection.execute(
+                "UPDATE relocation_applications SET state='cancelled',revision=revision+1 WHERE application_id=?",
+                (application_id,),
+            )
+            response = {
+                "application_id": application_id,
+                "state": "cancelled",
+                "released_reservations": released,
+                "discarded_offers": discarded,
+                "retained_delivered": retained,
+            }
+            self._idempotency_store("relocation-cancel", key, request_digest, response)
+            self._audit(
+                "relocation_application",
+                application_id,
+                "relocation.application_cancelled",
+                actor_id,
+                {"released": released, "retained_delivered": retained},
+            )
+        return response
+
+    def relocation_lineage(self, actor_id: str, application_id: str) -> dict[str, Any]:
+        self._require(actor_id, "relocation.read")
+        application = self._relocation_application_row(application_id)
+        plans = self.connection.execute(
+            "SELECT * FROM relocation_plans WHERE application_id=? ORDER BY created_at,candidate_rank",
+            (application_id,),
+        ).fetchall()
+        reservations = self.connection.execute(
+            "SELECT r.*,res.revision AS resource_revision_current,s.revision AS site_revision_current "
+            "FROM relocation_reservations r "
+            "JOIN resettlement_resources res ON res.resource_id=r.resource_id "
+            "JOIN resettlement_sites s ON s.site_id=r.site_id "
+            "WHERE r.application_id=? ORDER BY r.reservation_id",
+            (application_id,),
+        ).fetchall()
+        entity_ids = [application_id, *[plan["plan_id"] for plan in plans]]
+        placeholders = ",".join("?" for _ in entity_ids)
+        events = self.connection.execute(
+            f"SELECT entity_type,entity_id,event_type,actor_id,created_at FROM supply_audit_events "
+            f"WHERE entity_id IN ({placeholders}) ORDER BY event_id",
+            entity_ids,
+        ).fetchall()
+        return {
+            "application": {
+                "application_id": application["application_id"],
+                "household_id": application["household_id"],
+                "origin_township": application["origin_township"],
+                "origin_village": application["origin_village"],
+                "household_size": application["household_size"],
+                "state": application["state"],
+                "revision": application["revision"],
+                "needs": json.loads(application["needs_json"]),
+            },
+            "plans": [
+                {
+                    "plan_id": plan["plan_id"],
+                    "rank": plan["candidate_rank"],
+                    "state": plan["state"],
+                    "revision": plan["revision"],
+                    "input_sha256": plan["input_sha256"],
+                    "assignments": json.loads(plan["assignments_json"]),
+                    "tradeoffs": json.loads(plan["tradeoffs_json"]),
+                    "unmet_conditions": json.loads(plan["unmet_json"]),
+                }
+                for plan in plans
+            ],
+            "reservations": [
+                {
+                    "reservation_id": reservation["reservation_id"],
+                    "plan_id": reservation["plan_id"],
+                    "resource_id": reservation["resource_id"],
+                    "site_id": reservation["site_id"],
+                    "state": reservation["state"],
+                    "resource_revision_frozen": reservation["resource_revision"],
+                    "resource_revision_current": reservation["resource_revision_current"],
+                    "site_revision_frozen": reservation["site_revision"],
+                    "site_revision_current": reservation["site_revision_current"],
+                    "delivered_at": reservation["delivered_at"],
+                    "released_at": reservation["released_at"],
+                }
+                for reservation in reservations
+            ],
+            "events": [dict(event) for event in events],
+        }

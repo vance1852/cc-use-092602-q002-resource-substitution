@@ -180,6 +180,94 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     PRIMARY KEY(scope, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS resettlement_sites (
+    site_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    township TEXT NOT NULL,
+    village TEXT NOT NULL,
+    infra_capacity_households INTEGER NOT NULL CHECK(infra_capacity_households >= 0),
+    reserved_households INTEGER NOT NULL DEFAULT 0 CHECK(reserved_households >= 0),
+    occupied_households INTEGER NOT NULL DEFAULT 0 CHECK(occupied_households >= 0),
+    revision INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended')),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resettlement_resources (
+    resource_id TEXT PRIMARY KEY,
+    site_id TEXT NOT NULL REFERENCES resettlement_sites(site_id),
+    kind TEXT NOT NULL CHECK(kind IN ('resettlement-home','turnover-home','homestead-quota')),
+    area_sqm TEXT NOT NULL,
+    max_household_size INTEGER NOT NULL CHECK(max_household_size > 0),
+    accessible INTEGER NOT NULL DEFAULT 0 CHECK(accessible IN (0,1)),
+    commute_minutes INTEGER NOT NULL CHECK(commute_minutes > 0),
+    school_km TEXT NOT NULL,
+    clinic_km TEXT NOT NULL,
+    eligible_townships TEXT NOT NULL DEFAULT '*',
+    capacity_households INTEGER NOT NULL DEFAULT 1 CHECK(capacity_households > 0),
+    reserved_households INTEGER NOT NULL DEFAULT 0 CHECK(reserved_households >= 0),
+    occupied_households INTEGER NOT NULL DEFAULT 0 CHECK(occupied_households >= 0),
+    revision INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','retired')),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resettlement_resources_site
+ON resettlement_resources(site_id, kind, state);
+
+CREATE TABLE IF NOT EXISTS relocation_applications (
+    application_id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    origin_township TEXT NOT NULL,
+    origin_village TEXT NOT NULL,
+    household_size INTEGER NOT NULL CHECK(household_size > 0),
+    needs_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'submitted'
+        CHECK(state IN ('submitted','planned','confirmed','moved_in','cancelled')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    submitted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relocation_plans (
+    plan_id TEXT PRIMARY KEY,
+    application_id TEXT NOT NULL REFERENCES relocation_applications(application_id),
+    candidate_rank INTEGER NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    assignments_json TEXT NOT NULL,
+    tradeoffs_json TEXT NOT NULL,
+    unmet_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'offered' CHECK(state IN ('offered','confirmed','superseded')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_relocation_plans_application
+ON relocation_plans(application_id, state, candidate_rank);
+
+CREATE TABLE IF NOT EXISTS relocation_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES relocation_plans(plan_id),
+    application_id TEXT NOT NULL REFERENCES relocation_applications(application_id),
+    resource_id TEXT NOT NULL REFERENCES resettlement_resources(resource_id),
+    site_id TEXT NOT NULL REFERENCES resettlement_sites(site_id),
+    resource_revision INTEGER NOT NULL,
+    site_revision INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'offered'
+        CHECK(state IN ('offered','reserved','delivered','released')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    released_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_relocation_reservations_application
+ON relocation_reservations(application_id, state);
+
 CREATE TABLE IF NOT EXISTS supply_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -198,7 +286,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

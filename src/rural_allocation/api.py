@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,7 @@ class Response:
 class JsonApplication:
     def __init__(self, service: SupplyService) -> None:
         self.service = service
+        self._lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +47,10 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
+
+    def _dispatch(self, method: str, target: str, headers: Mapping[str, str] | None, body: bytes) -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -85,6 +91,30 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if method == "POST" and path == "/resettlement/sites":
+                return Response(201, self.service.create_resettlement_site(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["resettlement", "sites"]:
+                return Response(200, self.service.resettlement_site(parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["resettlement", "sites"] and parts[3] == "state":
+                return Response(200, self.service.set_resettlement_site_state(actor, parts[2], payload.get("state"), payload.get("expected_revision")))
+            if method == "POST" and path == "/resettlement/resources":
+                return Response(201, self.service.create_resettlement_resource(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["resettlement", "resources"]:
+                return Response(200, self.service.resettlement_resource(parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["resettlement", "resources"] and parts[3] == "state":
+                return Response(200, self.service.set_resettlement_resource_state(actor, parts[2], payload.get("state"), payload.get("expected_revision")))
+            if method == "POST" and path == "/relocation/applications":
+                return Response(201, self.service.register_relocation_application(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "applications"] and parts[3] == "candidates":
+                return Response(200, self.service.generate_relocation_candidates(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "applications"] and parts[3] == "move-in":
+                return Response(200, self.service.move_in_application(actor, parts[2], payload.get("expected_revision")))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "applications"] and parts[3] == "cancel":
+                return Response(200, self.service.cancel_relocation_application(actor, parts[2], payload.get("idempotency_key")))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["relocation", "applications"] and parts[3] == "lineage":
+                return Response(200, self.service.relocation_lineage(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["relocation", "plans"] and parts[3] == "confirm":
+                return Response(200, self.service.confirm_relocation_plan(actor, parts[2], payload.get("expected_revision"), payload.get("idempotency_key")))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
